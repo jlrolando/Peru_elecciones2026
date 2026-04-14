@@ -19,4 +19,3 @@ Este proyecto contiene un pipeline desarrollado en **R** para extraer, procesar 
 
 ---
 *Desarrollado para el análisis técnico y procesamiento de datos electorales.*
-Tip adicional: Si quieres que los emojis no se vean raros, asegúrate de que al guardar el archivo en tu editor (o en GitHub) la codificación sea UTF-8.
