@@ -1,0 +1,759 @@
+#!/usr/bin/env Rscript
+# ==============================================================================
+# ONPE 2026 — District-Level Presidential Results
+# Pulls votes for 5 candidates + % actas contabilizadas for every district
+#
+# BEFORE RUNNING:
+#   install.packages(c("httr", "jsonlite", "dplyr", "readr"))
+#
+# UBIGEO SOURCE:
+#   Download the CSV from: https://github.com/geodir/ubigeo-peru
+#   Direct link to raw CSV:
+#     https://raw.githubusercontent.com/geodir/ubigeo-peru/master/geodir-ubigeo-inei.csv
+#   Save it as "geodir-ubigeo-inei.csv" in your working directory.
+#
+# IMPORTANT — RENIEC vs INEI ubigeo codes:
+#   ONPE historically uses RENIEC ubigeo codes, which CAN differ from INEI
+#   codes for some districts. In our testing, the ONPE API accepted INEI codes
+#   (e.g., 010101 for Chachapoyas). If you get empty results for specific
+#   districts, the code mismatch is the likely cause. A RENIEC-INEI concordance
+#   table is available at: https://github.com/CONCYTEC/ubigeo-peru
+#
+# RUNTIME ESTIMATE:
+#   ~1,874 districts × 2 API calls × 0.5s delay ≈ 30 minutes
+# ==============================================================================
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(readr)
+
+setwd("C:/Users/jlrolando/UFL Dropbox/Jose Luis Rolando Betancourt/elecciones2026/")
+
+# --- Log to file --------------------------------------------------------------
+options(cli.num_colors = 0)
+options(crayon.enabled = FALSE)
+options(cli.unicode = FALSE)
+options(readr.show_progress = FALSE)
+
+LOG_FILE <- "onpe_extrapolation_output_1033.txt"
+writeLines("", LOG_FILE)
+
+msg <- function(...) {
+  txt <- paste0(...)
+  
+  # 1. Print to the RStudio Console
+  cat(txt, "\n") 
+  
+  # 2. Prepare clean text for the file
+  clean <- gsub("\033\\[[0-9;]*[A-Za-z]", "", txt)
+  clean <- gsub("[^[:print:]\n\t]", "", clean)
+  
+  # 3. Force write to the file immediately
+  con <- file(LOG_FILE, open = "a")
+  writeLines(clean, con)
+  close(con) # Closing the connection forces R to save the file to disk
+}
+
+
+# --- 1. Load ubigeo table ----------------------------------------------------
+# Rationale: the geodir CSV has columns Ubigeo (6-digit INEI code), Distrito,
+# Provincia, Departamento. We derive dept and province codes by zero-padding.
+
+ubigeo_raw <- read_csv("geodir-ubigeo-reniec.csv", col_types = cols(.default = "c"))
+
+ubigeo <- ubigeo_raw %>%
+  transmute(
+    dist_code = Ubigeo,                                    # e.g., "010101"
+    dept_code = paste0(substr(Ubigeo, 1, 2), "0000"),      # e.g., "010000"
+    prov_code = paste0(substr(Ubigeo, 1, 4), "00"),        # e.g., "010100"
+    departamento = Departamento,
+    provincia    = Provincia,
+    distrito     = Distrito
+  )
+
+message("Loaded ", nrow(ubigeo), " districts")
+
+# --- 2. API configuration ----------------------------------------------------
+
+BASE <- "https://resultadoelectoral.onpe.gob.pe/presentacion-backend"
+VOTES_EP <- paste0(BASE, "/eleccion-presidencial/participantes-ubicacion-geografica-nombre")
+ACTAS_EP <- paste0(BASE, "/resumen-general/totales")
+
+# Candidates of interest — names exactly as they appear in the ONPE API
+# Rationale: the API returns full uppercase names. We match on these strings
+# and use short labels for the output columns.
+CANDIDATES <- c(
+  "Fujimori"     = "KEIKO SOFIA FUJIMORI HIGUCHI",
+  "Lopez_Aliaga" = "RAFAEL BERNARDO L\u00d3PEZ ALIAGA CAZORLA",
+  "Nieto"        = "JORGE NIETO MONTESINOS",
+  "Belmont"      = "RICARDO PABLO BELMONT CASSINELLI",
+  "Sanchez"      = "ROBERTO HELBERT SANCHEZ PALOMINO"
+)
+
+# NOTE on accent marks: The API may return "LÓPEZ" (with accent) or "LOPEZ"
+# (without). If matching fails, run one test query and inspect the exact
+# spelling:
+#   test_url <- paste0(VOTES_EP, "?tipoFiltro=ubigeo_nivel_03",
+#     "&idAmbitoGeografico=1&ubigeoNivel1=010000&ubigeoNivel2=010100",
+#     "&ubigeoNivel3=010101&idEleccion=10")
+#   fromJSON(content(GET(test_url), "text"))$data$nombreCandidato
+
+# --- 3. Fetch helper with retries --------------------------------------------
+# Rationale: transient errors (timeouts, 429s) are expected when hitting the
+# ONPE server ~3,700 times. We retry 3× with exponential backoff.
+
+safe_GET <- function(url, params, retries = 1) {
+  for (i in seq_len(retries)) {
+    resp <- tryCatch(
+      GET(url, query = params, timeout(10),
+          add_headers(
+            `User-Agent` = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            `Referer` = "https://resultadoelectoral.onpe.gob.pe/main/presidenciales",
+            `Accept` = "application/json"
+          )
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(resp) && status_code(resp) == 200) {
+      txt <- content(resp, as = "text", encoding = "UTF-8")
+      if (startsWith(trimws(txt), "{")) {
+        return(txt)
+      }
+    }
+    Sys.sleep(i * 2)
+  }
+  return(NA_character_)
+}
+
+# --- 4. Query one district ----------------------------------------------------
+
+query_district <- function(dept, prov, dist) {
+  
+  # 4a. Actas contabilizadas
+  actas_json <- safe_GET(ACTAS_EP, list(
+    idAmbitoGeografico   = 1,
+    idEleccion           = 10,
+    tipoFiltro           = "ubigeo_nivel_03",
+    idUbigeoDepartamento = dept,
+    idUbigeoProvincia    = prov,
+    idUbigeoDistrito     = dist
+  ))
+  if (is.na(actas_json)) return(NULL)
+  actas <- fromJSON(actas_json)
+  if (!actas$success) return(NULL)
+  
+  # 4b. Votes per candidate
+  votes_json <- safe_GET(VOTES_EP, list(
+    tipoFiltro         = "ubigeo_nivel_03",
+    idAmbitoGeografico = 1,
+    ubigeoNivel1       = dept,
+    ubigeoNivel2       = prov,
+    ubigeoNivel3       = dist,
+    idEleccion         = 10
+  ))
+  if (is.na(votes_json)) return(NULL)
+  votes <- fromJSON(votes_json)
+  if (!votes$success || length(votes$data) == 0) return(NULL)
+  
+  # 4c. Build one-row result
+  row <- tibble(
+    dist_ubigeo          = dist,
+    pct_actas            = actas$data$actasContabilizadas,
+    actas_contabilizadas = actas$data$contabilizadas,
+    total_actas          = actas$data$totalActas
+  )
+  
+  # Extract each candidate's votes
+  cands <- votes$data
+  for (short in names(CANDIDATES)) {
+    full_name <- CANDIDATES[short]
+    match <- cands[cands$nombreCandidato == full_name, ]
+    if (nrow(match) == 1) {
+      row[[paste0("votos_", short)]] <- match$totalVotosValidos
+      row[[paste0("pct_", short)]]   <- match$porcentajeVotosValidos
+    } else {
+      row[[paste0("votos_", short)]] <- NA_integer_
+      row[[paste0("pct_", short)]]   <- NA_real_
+    }
+  }
+  
+  return(row)
+}
+
+# --- 5. Run across all districts ----------------------------------------------
+# Rationale: we use a simple for-loop (not purrr::map) for easier progress
+# tracking and error handling. Results are appended to a list, then bound.
+
+results <- vector("list", nrow(ubigeo))
+
+message("Starting queries at ", Sys.time())
+
+for (i in seq_len(nrow(ubigeo))) {
+  
+  if (i %% 25 == 0 || i == 1) {
+    message(sprintf("[%s] District %d / %d — %s, %s, %s",
+                    format(Sys.time(), "%H:%M:%S"), i, nrow(ubigeo),
+                    ubigeo$departamento[i], ubigeo$provincia[i], ubigeo$distrito[i]))
+  }
+  
+  results[[i]] <- tryCatch(
+    query_district(ubigeo$dept_code[i], ubigeo$prov_code[i], ubigeo$dist_code[i]),
+    error = function(e) {
+      message("  ERROR at row ", i, ": ", e$message)
+      NULL
+    }
+  )
+  
+  # Polite delay — 0.05s between requests
+  Sys.sleep(0.05)
+}
+
+# --- 6. Combine and merge with district names ---------------------------------
+
+df <- bind_rows(results)
+message("Got data for ", nrow(df), " districts out of ", nrow(ubigeo))
+
+# Merge with ubigeo names
+final <- ubigeo %>%
+  left_join(df, by = c("dist_code" = "dist_ubigeo"))
+
+# --- 7. Save ------------------------------------------------------------------
+
+write_csv(final, "onpe_2026_district_results_04142026_1033.csv")
+message("Saved to onpe_2026_district_results_04142026_1033.csv")
+
+# Quick summary
+message("\n=== Summary ===")
+message("Districts with data: ", sum(!is.na(final$pct_actas)))
+message("Districts missing:   ", sum(is.na(final$pct_actas)))
+message("Mean % actas:        ", round(mean(final$pct_actas, na.rm = TRUE), 1), "%")
+
+
+####Extrapolation and Voto Extranjero
+
+#!/usr/bin/env Rscript
+# ==============================================================================
+# ONPE 2026 — Full Extrapolation: Domestic Districts + Extranjero by Continent
+#
+# Logic:
+#   DOMESTIC:
+#     1. Districts with actas > 0 → direct extrapolation
+#     2. Districts with 0 actas → impute from province (excl. big cities),
+#        falling back to department
+#   EXTRANJERO:
+#     1. Fetch votes + actas per continent from ONPE API
+#     2. Continents with actas > 0 → direct extrapolation
+#     3. Continents with 0 actas (e.g., Africa) → impute from average of
+#        other continents
+#
+# REQUIRES:
+#   - onpe_2026_district_results_04132026_2323.csv in working directory
+#   - Internet connection (to fetch extranjero)
+#   - install.packages(c("httr", "jsonlite", "readr"))
+#
+# OUTPUT:
+#   - onpe_2026_extrapolated_full.csv
+#   - onpe_extrapolation_output.txt
+# ==============================================================================
+
+# --- API config ---------------------------------------------------------------
+
+BASE <- "https://resultadoelectoral.onpe.gob.pe/presentacion-backend"
+VOTES_EP <- paste0(BASE, "/eleccion-presidencial/participantes-ubicacion-geografica-nombre")
+ACTAS_EP <- paste0(BASE, "/resumen-general/totales")
+
+CAND_FULLNAMES <- c(
+  Fujimori     = "KEIKO SOFIA FUJIMORI HIGUCHI",
+  Lopez_Aliaga = "RAFAEL BERNARDO L\u00d3PEZ ALIAGA CAZORLA",
+  Nieto        = "JORGE NIETO MONTESINOS",
+  Belmont      = "RICARDO PABLO BELMONT CASSINELLI",
+  Sanchez      = "ROBERTO HELBERT SANCHEZ PALOMINO"
+)
+
+candidates <- names(CAND_FULLNAMES)
+
+labels <- c(
+  Fujimori     = "Keiko Fujimori (Fuerza Popular)",
+  Lopez_Aliaga = "Rafael Lopez Aliaga (Renovacion Popular)",
+  Nieto        = "Jorge Nieto (Buen Gobierno)",
+  Belmont      = "Ricardo Belmont (Civico Obras)",
+  Sanchez      = "Roberto Sanchez (Juntos por el Peru)"
+)
+
+short <- c(Fujimori = "FUJ", Lopez_Aliaga = "RLA", Nieto = "NTO",
+           Belmont = "BLM", Sanchez = "RSP")
+
+# Continent ubigeo codes (from ONPE API)
+CONTINENTS <- data.frame(
+  ubigeo = c("910000", "920000", "930000", "940000", "950000"),
+  nombre = c("AFRICA", "AMERICA", "ASIA", "EUROPA", "OCEANIA"),
+  stringsAsFactors = FALSE
+)
+
+# --- HTTP helper --------------------------------------------------------------
+
+safe_GET <- function(url, params, retries = 2) {
+  for (i in seq_len(retries)) {
+    resp <- tryCatch(
+      GET(url, query = params, timeout(15),
+          add_headers(
+            `User-Agent` = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            `Referer`    = "https://resultadoelectoral.onpe.gob.pe/main/presidenciales",
+            `Accept`     = "application/json"
+          )
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(resp) && status_code(resp) == 200) {
+      txt <- content(resp, as = "text", encoding = "UTF-8")
+      if (startsWith(trimws(txt), "{")) return(txt)
+    }
+    Sys.sleep(i * 2)
+  }
+  return(NA_character_)
+}
+
+# ==============================================================================
+# PART A: FETCH EXTRANJERO DATA BY CONTINENT
+# ==============================================================================
+
+msg(paste(rep("=", 70), collapse = ""))
+msg("  FETCHING EXTRANJERO DATA BY CONTINENT")
+msg(paste(rep("=", 70), collapse = ""))
+
+# Rationale: extranjero uses idAmbitoGeografico=2. Each continent is a
+# "department" within that scope, queried via tipoFiltro=ubigeo_nivel_01.
+# We try idAmbitoGeografico=2 first; if that fails we try other values.
+
+fetch_continent <- function(ubigeo, amb_id = 2) {
+  
+  # Actas
+  actas_json <- safe_GET(ACTAS_EP, list(
+    idAmbitoGeografico   = amb_id,
+    idEleccion           = 10,
+    tipoFiltro           = "ubigeo_nivel_01",
+    idUbigeoDepartamento = ubigeo
+  ))
+  
+  actas_data <- NULL
+  if (!is.na(actas_json)) {
+    parsed <- fromJSON(actas_json)
+    if (parsed$success) actas_data <- parsed$data
+  }
+  
+  # Votes
+  votes_json <- safe_GET(VOTES_EP, list(
+    tipoFiltro         = "ubigeo_nivel_01",
+    idAmbitoGeografico = amb_id,
+    ubigeoNivel1       = ubigeo,
+    idEleccion         = 10
+  ))
+  
+  votes_data <- NULL
+  if (!is.na(votes_json)) {
+    parsed <- fromJSON(votes_json)
+    if (parsed$success && length(parsed$data) > 0) votes_data <- parsed$data
+  }
+  
+  return(list(actas = actas_data, votes = votes_data))
+}
+
+# Try fetching each continent
+continent_results <- list()
+
+for (i in seq_len(nrow(CONTINENTS))) {
+  ub <- CONTINENTS$ubigeo[i]
+  nm <- CONTINENTS$nombre[i]
+  msg(sprintf("\n  Fetching %s (%s)...", nm, ub))
+  
+  res <- fetch_continent(ub, amb_id = 2)
+  
+  # If amb_id=2 didn't work, try 3
+  if (is.null(res$actas) && is.null(res$votes)) {
+    msg("    amb_id=2 failed, trying amb_id=3...")
+    res <- fetch_continent(ub, amb_id = 3)
+  }
+  
+  row <- data.frame(
+    continent    = nm,
+    ubigeo       = ub,
+    pct_actas    = NA_real_,
+    total_actas  = NA_integer_,
+    contabilizadas = NA_integer_,
+    total_valid_counted = NA_real_,
+    stringsAsFactors = FALSE
+  )
+  for (c in candidates) {
+    row[[paste0("votos_", c)]] <- NA_integer_
+    row[[paste0("pct_", c)]]   <- NA_real_
+  }
+  
+  if (!is.null(res$actas)) {
+    row$pct_actas    <- res$actas$actasContabilizadas
+    row$total_actas  <- res$actas$totalActas
+    row$contabilizadas <- res$actas$contabilizadas
+    row$total_valid_counted <- res$actas$totalVotosValidos
+    msg(sprintf("    Actas: %.3f%% (%d / %d)",
+                    row$pct_actas, row$contabilizadas, row$total_actas))
+  } else {
+    msg("    No actas data")
+  }
+  
+  if (!is.null(res$votes)) {
+    for (c in candidates) {
+      match <- res$votes[res$votes$nombreCandidato == CAND_FULLNAMES[c], ]
+      if (nrow(match) == 1) {
+        row[[paste0("votos_", c)]] <- match$totalVotosValidos
+        row[[paste0("pct_", c)]]   <- match$porcentajeVotosValidos
+      }
+    }
+    msg(sprintf("    Votes found for %d candidates",
+                    sum(!is.na(row[paste0("votos_", candidates)]))))
+  } else {
+    msg("    No votes data")
+  }
+  
+  continent_results[[i]] <- row
+}
+
+ext_df <- do.call(rbind, continent_results)
+
+msg("\n--- Continent summary ---")
+for (i in seq_len(nrow(ext_df))) {
+  msg(sprintf("  %-10s  pct_actas: %6s%%  total_actas: %s",
+                  ext_df$continent[i],
+                  ifelse(is.na(ext_df$pct_actas[i]), "  NA", sprintf("%6.2f", ext_df$pct_actas[i])),
+                  ifelse(is.na(ext_df$total_actas[i]), "NA", ext_df$total_actas[i])))
+}
+
+# --- Impute continents with no data from average of those with data -----------
+# Rationale: Africa (or any continent with 0 actas) needs imputation.
+# We use the average candidate shares and votes-per-acta from all continents
+# that DO have data.
+
+has_data <- ext_df$pct_actas > 0 & !is.na(ext_df$pct_actas)
+no_data  <- !has_data | is.na(ext_df$pct_actas)
+
+if (any(has_data)) {
+  # Average votes per acta across continents with data
+  total_valid_ext <- sum(ext_df$total_valid_counted[has_data], na.rm = TRUE)
+  total_actas_counted_ext <- sum(ext_df$contabilizadas[has_data], na.rm = TRUE)
+  avg_vpa <- total_valid_ext / total_actas_counted_ext
+  
+  # Average candidate shares
+  total_cand_ext <- sapply(candidates, function(c)
+    sum(ext_df[[paste0("votos_", c)]][has_data], na.rm = TRUE))
+  sum_cand_ext <- sum(total_cand_ext)
+  avg_shares <- total_cand_ext / sum_cand_ext
+  
+  msg(sprintf("\n  Average votes per acta (extranjero): %.1f", avg_vpa))
+  msg("  Average candidate shares for imputation:")
+  for (c in candidates) {
+    msg(sprintf("    %-15s: %.2f%%", labels[c], avg_shares[c] * 100))
+  }
+}
+
+# Extrapolate each continent
+for (c in candidates) ext_df[[paste0("extrap_", c)]] <- 0
+ext_df$method <- ""
+
+for (i in seq_len(nrow(ext_df))) {
+  pct <- ext_df$pct_actas[i]
+  ta  <- ext_df$total_actas[i]
+  if (is.na(ta)) ta <- 0
+  
+  if (!is.na(pct) && pct > 0) {
+    # Direct extrapolation
+    for (c in candidates) {
+      v <- ext_df[[paste0("votos_", c)]][i]
+      if (is.na(v)) v <- 0
+      ext_df[[paste0("extrap_", c)]][i] <- v * (100 / pct)
+    }
+    ext_df$method[i] <- "direct"
+    
+  } else if (ta > 0 && any(has_data)) {
+    # Impute from average of other continents
+    est_valid <- avg_vpa * ta
+    for (c in candidates) {
+      ext_df[[paste0("extrap_", c)]][i] <- est_valid * avg_shares[c]
+    }
+    ext_df$method[i] <- "imputed_avg_continents"
+    
+  } else {
+    ext_df$method[i] <- "skipped"
+  }
+}
+
+msg("\n--- Extranjero extrapolated ---")
+for (i in seq_len(nrow(ext_df))) {
+  msg(sprintf("  %-10s [%s]  FUJ:%7s  RLA:%7s  NTO:%7s  BLM:%7s  RSP:%7s",
+                  ext_df$continent[i], ext_df$method[i],
+                  format(round(ext_df$extrap_Fujimori[i]), big.mark = ","),
+                  format(round(ext_df$extrap_Lopez_Aliaga[i]), big.mark = ","),
+                  format(round(ext_df$extrap_Nieto[i]), big.mark = ","),
+                  format(round(ext_df$extrap_Belmont[i]), big.mark = ","),
+                  format(round(ext_df$extrap_Sanchez[i]), big.mark = ",")))
+}
+
+ext_totals <- sapply(candidates, function(c)
+  sum(ext_df[[paste0("extrap_", c)]], na.rm = TRUE))
+
+msg("\n  EXTRANJERO TOTAL:")
+for (c in candidates[order(-ext_totals)]) {
+  msg(sprintf("    %-45s %10s",
+                  labels[c], format(round(ext_totals[c]), big.mark = ",")))
+}
+
+# Total valid extranjero (all candidates)
+ext_total_valid <- 0
+for (i in seq_len(nrow(ext_df))) {
+  pct <- ext_df$pct_actas[i]
+  ta  <- ext_df$total_actas[i]
+  tvc <- ext_df$total_valid_counted[i]
+  if (!is.na(pct) && pct > 0 && !is.na(tvc)) {
+    ext_total_valid <- ext_total_valid + tvc * (100 / pct)
+  } else if (!is.na(ta) && ta > 0 && exists("avg_vpa")) {
+    ext_total_valid <- ext_total_valid + avg_vpa * ta
+  }
+}
+
+# ==============================================================================
+# PART B: DOMESTIC DISTRICT EXTRAPOLATION
+# ==============================================================================
+
+msg("\n", paste(rep("=", 70), collapse = ""))
+msg("  DOMESTIC DISTRICT EXTRAPOLATION")
+msg(paste(rep("=", 70), collapse = ""))
+
+df <- read_csv(
+  "onpe_2026_district_results_04132026_2323.csv",
+  col_types = cols(.default = "c")
+)
+
+num_cols <- c("pct_actas","actas_contabilizadas","total_actas",
+              "votos_Fujimori","pct_Fujimori",
+              "votos_Lopez_Aliaga","pct_Lopez_Aliaga",
+              "votos_Nieto","pct_Nieto",
+              "votos_Belmont","pct_Belmont",
+              "votos_Sanchez","pct_Sanchez")
+for (col in num_cols) {
+  if (col %in% names(df)) df[[col]] <- as.numeric(df[[col]])
+}
+df$pct_actas[is.na(df$pct_actas)] <- 0
+
+msg("Loaded ", nrow(df), " districts")
+msg("  With data:  ", sum(df$pct_actas > 0))
+msg("  Zero actas: ", sum(df$pct_actas == 0))
+
+# Flag big-city districts
+df$is_big_city <- FALSE
+for (prov in unique(df$prov_code)) {
+  idx <- which(df$prov_code == prov & df$pct_actas > 0)
+  if (length(idx) >= 4) {
+    threshold <- quantile(df$total_actas[idx], 0.75, na.rm = TRUE)
+    df$is_big_city[idx[df$total_actas[idx] >= threshold]] <- TRUE
+  } else if (length(idx) >= 2) {
+    df$is_big_city[idx[which.max(df$total_actas[idx])]] <- TRUE
+  }
+}
+msg("Big-city districts excluded from imputation: ", sum(df$is_big_city))
+
+# Estimate valid votes per district
+estimate_valid <- function(v, p) {
+  ifelse(!is.na(p) & p > 0 & !is.na(v), v / (p / 100), 0)
+}
+df$est_valid <- estimate_valid(df$votos_Fujimori, df$pct_Fujimori)
+
+# Province rates (excl big cities)
+impute_pool <- df[df$pct_actas > 0 & !df$is_big_city, ]
+
+prov_rates <- list()
+for (prov in unique(impute_pool$prov_code)) {
+  sub <- impute_pool[impute_pool$prov_code == prov, ]
+  tv <- sum(sub$est_valid, na.rm = TRUE)
+  ta <- sum(sub$actas_contabilizadas, na.rm = TRUE)
+  cv <- sapply(candidates, function(c) sum(sub[[paste0("votos_", c)]], na.rm = TRUE))
+  tc <- sum(cv)
+  if (ta > 0 && tc > 0) prov_rates[[prov]] <- list(vpa = tv / ta, shares = cv / tc)
+}
+
+# Department rates (excl big cities)
+dept_rates <- list()
+for (dept in unique(impute_pool$dept_code)) {
+  sub <- impute_pool[impute_pool$dept_code == dept, ]
+  tv <- sum(sub$est_valid, na.rm = TRUE)
+  ta <- sum(sub$actas_contabilizadas, na.rm = TRUE)
+  cv <- sapply(candidates, function(c) sum(sub[[paste0("votos_", c)]], na.rm = TRUE))
+  tc <- sum(cv)
+  if (ta > 0 && tc > 0) dept_rates[[dept]] <- list(vpa = tv / ta, shares = cv / tc)
+}
+
+msg("Provinces with rates: ", length(prov_rates))
+msg("Departments with rates: ", length(dept_rates))
+
+# Extrapolate
+for (c in candidates) df[[paste0("extrap_", c)]] <- 0
+df$method <- ""
+counts <- c(direct = 0, province = 0, department = 0, skipped = 0)
+
+for (i in seq_len(nrow(df))) {
+  pct  <- df$pct_actas[i]
+  prov <- df$prov_code[i]
+  dept <- df$dept_code[i]
+  ta   <- df$total_actas[i]; if (is.na(ta)) ta <- 0
+  
+  if (!is.na(pct) && pct > 0) {
+    for (c in candidates) {
+      v <- df[[paste0("votos_", c)]][i]; if (is.na(v)) v <- 0
+      df[[paste0("extrap_", c)]][i] <- v * (100 / pct)
+    }
+    df$method[i] <- "direct"; counts["direct"] <- counts["direct"] + 1
+    
+  } else if (ta > 0 && prov %in% names(prov_rates)) {
+    ev <- prov_rates[[prov]]$vpa * ta
+    for (c in candidates) df[[paste0("extrap_", c)]][i] <- ev * prov_rates[[prov]]$shares[c]
+    df$method[i] <- "province"; counts["province"] <- counts["province"] + 1
+    
+  } else if (ta > 0 && dept %in% names(dept_rates)) {
+    ev <- dept_rates[[dept]]$vpa * ta
+    for (c in candidates) df[[paste0("extrap_", c)]][i] <- ev * dept_rates[[dept]]$shares[c]
+    df$method[i] <- "department"; counts["department"] <- counts["department"] + 1
+    
+  } else {
+    df$method[i] <- "skipped"; counts["skipped"] <- counts["skipped"] + 1
+  }
+}
+
+msg("\n  Direct:     ", counts["direct"])
+msg("  Province:   ", counts["province"])
+msg("  Department: ", counts["department"])
+msg("  Skipped:    ", counts["skipped"])
+
+# ==============================================================================
+# PART C: COMBINE DOMESTIC + EXTRANJERO
+# ==============================================================================
+
+dom_totals <- sapply(candidates, function(c)
+  sum(df[[paste0("extrap_", c)]], na.rm = TRUE))
+
+national <- dom_totals + ext_totals
+
+# Total valid (all candidates)
+total_valid_domestic <- 0
+for (dept in unique(df$dept_code)) {
+  sub <- df[df$dept_code == dept, ]
+  sub_d <- sub[sub$pct_actas > 0, ]
+  if (nrow(sub_d) > 0) {
+    cv <- sum(sub_d$est_valid, na.rm = TRUE)
+    ca <- sum(sub_d$actas_contabilizadas, na.rm = TRUE)
+    ta <- sum(sub$total_actas, na.rm = TRUE)
+    if (ca > 0) total_valid_domestic <- total_valid_domestic + cv * (ta / ca)
+  }
+}
+total_valid <- total_valid_domestic + ext_total_valid
+pct_national <- national / total_valid * 100
+sorted_cands <- candidates[order(-national)]
+
+# ==============================================================================
+# PART D: PRINT RESULTS
+# ==============================================================================
+
+msg("\n", paste(rep("=", 70), collapse = ""))
+msg("  ONPE 2026 — EXTRAPOLATED PRESIDENTIAL RESULTS")
+msg("  District + continent extrapolation, big-city excluded imputation")
+msg(paste(rep("=", 70), collapse = ""))
+
+msg(sprintf("\n  %-45s %15s %10s", "Candidate", "Extrap.Votes", "% Valid"))
+msg(paste(rep("-", 72), collapse = ""))
+for (c in sorted_cands) {
+  msg(sprintf("  %-45s %13s %9.2f%%",
+                  labels[c], format(round(national[c]), big.mark = ","), pct_national[c]))
+  msg(sprintf("    (domestic: %s + extranjero: %s)",
+                  format(round(dom_totals[c]), big.mark = ","),
+                  format(round(ext_totals[c]), big.mark = ",")))
+}
+msg(sprintf("\n  Est. total valid votes: %s (domestic: %s + ext: %s)",
+                format(round(total_valid), big.mark = ","),
+                format(round(total_valid_domestic), big.mark = ","),
+                format(round(ext_total_valid), big.mark = ",")))
+
+# Segunda vuelta
+msg("\n", paste(rep("=", 70), collapse = ""))
+msg("  SEGUNDA VUELTA PROJECTION")
+msg(paste(rep("=", 70), collapse = ""))
+msg(sprintf("\n  1st: %s", labels[sorted_cands[1]]))
+msg(sprintf("       %s votes (%.2f%%)",
+                format(round(national[sorted_cands[1]]), big.mark = ","), pct_national[sorted_cands[1]]))
+msg(sprintf("\n  2nd: %s", labels[sorted_cands[2]]))
+msg(sprintf("       %s votes (%.2f%%)",
+                format(round(national[sorted_cands[2]]), big.mark = ","), pct_national[sorted_cands[2]]))
+gap23 <- national[sorted_cands[2]] - national[sorted_cands[3]]
+msg(sprintf("\n  Margin 2nd-3rd: %s votes (%.2f pp)",
+                format(round(gap23), big.mark = ","), gap23 / total_valid * 100))
+msg(sprintf("  3rd: %s (%s votes, %.2f%%)",
+                labels[sorted_cands[3]],
+                format(round(national[sorted_cands[3]]), big.mark = ","), pct_national[sorted_cands[3]]))
+
+# Department + continent breakdown
+msg("\n", paste(rep("=", 70), collapse = ""))
+msg("  BREAKDOWN BY DEPARTMENT / CONTINENT")
+msg(paste(rep("=", 70), collapse = ""))
+
+# Domestic departments
+dept_extrap <- list()
+for (dept in sort(unique(df$departamento))) {
+  sub <- df[df$departamento == dept, ]
+  vals <- sapply(candidates, function(c) sum(sub[[paste0("extrap_", c)]], na.rm = TRUE))
+  dept_extrap[[dept]] <- vals
+}
+# Add continents
+for (i in seq_len(nrow(ext_df))) {
+  vals <- sapply(candidates, function(c) ext_df[[paste0("extrap_", c)]][i])
+  dept_extrap[[paste0("EXT-", ext_df$continent[i])]] <- vals
+}
+
+msg(sprintf("\n  %-20s %-4s %10s %10s %10s %10s %10s",
+                "Region", "Win", "FUJ", "RLA", "NTO", "BLM", "RSP"))
+msg(paste(rep("-", 78), collapse = ""))
+for (nm in names(dept_extrap)) {
+  d <- dept_extrap[[nm]]
+  winner <- names(which.max(d))
+  msg(sprintf("  %-20s %-4s %10s %10s %10s %10s %10s",
+                  nm, short[winner],
+                  format(round(d["Fujimori"]), big.mark = ","),
+                  format(round(d["Lopez_Aliaga"]), big.mark = ","),
+                  format(round(d["Nieto"]), big.mark = ","),
+                  format(round(d["Belmont"]), big.mark = ","),
+                  format(round(d["Sanchez"]), big.mark = ",")))
+}
+
+# ==============================================================================
+# PART E: SAVE
+# ==============================================================================
+
+# Add extranjero continents as rows to the output
+ext_out <- data.frame(
+  departamento = paste0("EXT-", ext_df$continent),
+  provincia    = ext_df$continent,
+  distrito     = ext_df$continent,
+  pct_actas    = ext_df$pct_actas,
+  total_actas  = ext_df$total_actas,
+  method       = ext_df$method,
+  is_big_city  = FALSE,
+  stringsAsFactors = FALSE
+)
+for (c in candidates) {
+  ext_out[[paste0("extrap_", c)]] <- ext_df[[paste0("extrap_", c)]]
+}
+
+out_cols <- c("departamento","provincia","distrito","pct_actas","total_actas",
+              "method","is_big_city", paste0("extrap_", candidates))
+
+df_out <- rbind(df[, out_cols], ext_out[, out_cols])
+
+write_csv(df_out, "onpe_2026_extrapolated_full")
+msg("\nSaved to onpe_2026_extrapolated_full")
+
+# Close log
+msg("Log saved to onpe_extrapolation_output.txt")
