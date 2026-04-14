@@ -9,15 +9,8 @@
 # UBIGEO SOURCE:
 #   Download the CSV from: https://github.com/geodir/ubigeo-peru
 #   Direct link to raw CSV:
-#     https://raw.githubusercontent.com/geodir/ubigeo-peru/master/geodir-ubigeo-inei.csv
-#   Save it as "geodir-ubigeo-inei.csv" in your working directory.
-#
-# IMPORTANT — RENIEC vs INEI ubigeo codes:
-#   ONPE historically uses RENIEC ubigeo codes, which CAN differ from INEI
-#   codes for some districts. In our testing, the ONPE API accepted INEI codes
-#   (e.g., 010101 for Chachapoyas). If you get empty results for specific
-#   districts, the code mismatch is the likely cause. A RENIEC-INEI concordance
-#   table is available at: https://github.com/CONCYTEC/ubigeo-peru
+#     https://raw.githubusercontent.com/geodir/ubigeo-peru/master/geodir-ubigeo-reniec.csv
+#   Save it as "geodir-ubigeo-reniec.csv" in your working directory.
 #
 # RUNTIME ESTIMATE:
 #   ~1,874 districts × 2 API calls × 0.5s delay ≈ 30 minutes
