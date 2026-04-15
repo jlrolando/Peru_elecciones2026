@@ -19,8 +19,7 @@ library(jsonlite)
 library(dplyr)
 library(readr)
 
-#setwd("C:/Users/jlrolando/UFL Dropbox/Jose Luis Rolando Betancourt/elecciones2026/")
-setwd("C:/Users/josel/UFL Dropbox/Jose Luis Rolando Betancourt/elecciones2026/")
+#setwd("")
 
 # --- Log to file --------------------------------------------------------------
 options(cli.num_colors = 0)
